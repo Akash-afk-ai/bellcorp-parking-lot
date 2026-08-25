@@ -33,9 +33,11 @@ async function getAvailability() {
   return data;
 }
 
-async function parkVehicle({ vehicleNumber, vehicleType }) {
+async function parkVehicle({ vehicleNumber, vehicleType, ownerName, phoneNumber, userId = null }) {
   const normalizedVehicleNumber = vehicleNumber.trim();
   const normalizedType = vehicleType.trim().toUpperCase();
+  const normalizedOwnerName = ownerName.trim();
+  const normalizedPhoneNumber = phoneNumber.trim();
 
   if (!normalizedVehicleNumber) {
     throw new AppError(400, 'Vehicle number is required');
@@ -54,12 +56,17 @@ async function parkVehicle({ vehicleNumber, vehicleType }) {
     const existingVehicle = await client.query(
       `SELECT id, vehicle_number, vehicle_type
        FROM vehicles
-       WHERE vehicle_number = $1 AND vehicle_type = $2`,
-      [normalizedVehicleNumber, normalizedType]
+       WHERE vehicle_number = $1
+       FOR UPDATE`,
+      [normalizedVehicleNumber]
     );
 
     let vehicleId;
     if (existingVehicle.rowCount > 0) {
+      if (existingVehicle.rows[0].vehicle_type !== normalizedType) {
+        throw new AppError(409, 'Vehicle number is already registered with a different vehicle type');
+      }
+
       const activeTicket = await client.query(
         `SELECT id FROM parking_tickets
          WHERE vehicle_id = $1 AND status = 'ACTIVE'`,
@@ -71,12 +78,16 @@ async function parkVehicle({ vehicleNumber, vehicleType }) {
       }
 
       vehicleId = existingVehicle.rows[0].id;
+      await client.query(
+        `UPDATE vehicles SET owner_name = $1, phone_number = $2 WHERE id = $3`,
+        [normalizedOwnerName, normalizedPhoneNumber, vehicleId]
+      );
     } else {
       const newVehicle = await client.query(
-        `INSERT INTO vehicles (vehicle_number, vehicle_type)
-         VALUES ($1, $2)
+        `INSERT INTO vehicles (vehicle_number, vehicle_type, owner_name, phone_number)
+         VALUES ($1, $2, $3, $4)
          RETURNING id`,
-        [normalizedVehicleNumber, normalizedType]
+        [normalizedVehicleNumber, normalizedType, normalizedOwnerName, normalizedPhoneNumber]
       );
       vehicleId = newVehicle.rows[0].id;
     }
@@ -95,12 +106,6 @@ async function parkVehicle({ vehicleNumber, vehicleType }) {
     );
 
     if (slotResult.rowCount === 0) {
-      await client.query('ROLLBACK');
-      await logAuditEvent({
-        eventType: 'PARKING_FULL',
-        vehicleNumber: normalizedVehicleNumber,
-        vehicleType: normalizedType,
-      });
       throw new AppError(409, 'Parking Full');
     }
 
@@ -129,12 +134,15 @@ async function parkVehicle({ vehicleNumber, vehicleType }) {
       ticketNumber: ticketResult.rows[0].ticket_number,
       vehicleNumber: normalizedVehicleNumber,
       vehicleType: normalizedType,
+      ownerName: normalizedOwnerName,
+      phoneNumber: normalizedPhoneNumber,
       slotNumber: slot.slot_number,
       entryTime: entryTime.toISOString(),
     };
 
     await logAuditEvent({
       eventType: 'VEHICLE_PARKED',
+      userId,
       vehicleNumber: normalizedVehicleNumber,
       vehicleType: normalizedType,
       ticketId: ticketResult.rows[0].id,
@@ -144,6 +152,17 @@ async function parkVehicle({ vehicleNumber, vehicleType }) {
     return response;
   } catch (error) {
     await client.query('ROLLBACK');
+    if (error.message === 'Parking Full') {
+      await logAuditEvent({
+        eventType: 'PARKING_FULL',
+        userId,
+        vehicleNumber: normalizedVehicleNumber,
+        vehicleType: normalizedType,
+      });
+    }
+    if (error.code === '23505') {
+      throw new AppError(409, 'Vehicle already parked');
+    }
     if (error instanceof AppError) {
       throw error;
     }
@@ -153,20 +172,21 @@ async function parkVehicle({ vehicleNumber, vehicleType }) {
   }
 }
 
-async function exitVehicle({ ticketNumber }) {
+async function exitVehicle({ ticketNumber, vehicleNumber, userId = null }) {
   const client = await pool.connect();
 
   try {
     await client.query('BEGIN');
 
+    const identifier = ticketNumber ? ticketNumber.trim() : vehicleNumber.trim();
     const ticketResult = await client.query(
-      `SELECT t.id, t.ticket_number, t.entry_time, t.status, v.vehicle_number, v.vehicle_type, s.id AS slot_id, s.slot_number
+      `SELECT t.id, t.ticket_number, t.entry_time, t.status, v.vehicle_number, v.vehicle_type, v.owner_name, v.phone_number, s.id AS slot_id, s.slot_number
        FROM parking_tickets t
        JOIN vehicles v ON v.id = t.vehicle_id
        JOIN parking_slots s ON s.id = t.slot_id
-       WHERE t.ticket_number = $1
+       WHERE ${ticketNumber ? 't.ticket_number' : 'v.vehicle_number'} = $1
        FOR UPDATE`,
-      [ticketNumber]
+      [identifier]
     );
 
     if (ticketResult.rowCount === 0) {
@@ -203,6 +223,8 @@ async function exitVehicle({ ticketNumber }) {
       ticketNumber: ticket.ticket_number,
       vehicleNumber: ticket.vehicle_number,
       vehicleType: ticket.vehicle_type,
+      ownerName: ticket.owner_name,
+      phoneNumber: ticket.phone_number,
       slotNumber: ticket.slot_number,
       entryTime: new Date(ticket.entry_time).toISOString(),
       exitTime: exitTime.toISOString(),
@@ -212,6 +234,7 @@ async function exitVehicle({ ticketNumber }) {
 
     await logAuditEvent({
       eventType: 'VEHICLE_EXITED',
+      userId,
       vehicleNumber: ticket.vehicle_number,
       vehicleType: ticket.vehicle_type,
       ticketId: ticket.id,
@@ -232,7 +255,7 @@ async function exitVehicle({ ticketNumber }) {
 
 async function getActiveTickets() {
   const result = await pool.query(
-    `SELECT t.ticket_number, v.vehicle_number, v.vehicle_type, s.slot_number, t.entry_time, t.status
+    `SELECT t.ticket_number, v.vehicle_number, v.vehicle_type, v.owner_name, v.phone_number, s.slot_number, t.entry_time, t.status
      FROM parking_tickets t
      JOIN vehicles v ON v.id = t.vehicle_id
      JOIN parking_slots s ON s.id = t.slot_id
@@ -245,12 +268,12 @@ async function getActiveTickets() {
 
 async function getHistory({ page = 1, limit = 20 }) {
   const safePage = Number(page) > 0 ? Number(page) : 1;
-  const safeLimit = Number(limit) > 0 ? Number(limit) : 20;
+  const safeLimit = Math.min(Number(limit) > 0 ? Number(limit) : 20, 100);
   const offset = (safePage - 1) * safeLimit;
 
   const totalResult = await pool.query('SELECT COUNT(*) AS total FROM parking_tickets WHERE status = $1', ['COMPLETED']);
   const rowsResult = await pool.query(
-    `SELECT t.ticket_number, v.vehicle_number, v.vehicle_type, s.slot_number, t.entry_time, t.exit_time, t.fare, t.status
+    `SELECT t.ticket_number, v.vehicle_number, v.vehicle_type, v.owner_name, v.phone_number, s.slot_number, t.entry_time, t.exit_time, t.fare, t.status
      FROM parking_tickets t
      JOIN vehicles v ON v.id = t.vehicle_id
      JOIN parking_slots s ON s.id = t.slot_id

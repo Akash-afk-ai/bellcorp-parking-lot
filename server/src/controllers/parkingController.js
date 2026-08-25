@@ -13,13 +13,13 @@ async function availability(req, res, next) {
     const data = await getAvailability();
     return sendSuccess(res, 200, { availability: data });
   } catch (error) {
-    return next(error || new AppError(500, 'Unable to fetch availability'));
+    return next(error instanceof AppError ? error : new AppError(500, 'Unable to fetch availability'));
   }
 }
 
 async function park(req, res, next) {
   try {
-    const ticket = await parkVehicle(req.body);
+    const ticket = await parkVehicle({ ...req.body, userId: req.user.userId });
     return sendSuccess(res, 201, { ticket });
   } catch (error) {
     return next(error || new AppError(500, 'Parking failed'));
@@ -28,7 +28,7 @@ async function park(req, res, next) {
 
 async function exit(req, res, next) {
   try {
-    const result = await exitVehicle(req.body);
+    const result = await exitVehicle({ ...req.body, userId: req.user.userId });
     return sendSuccess(res, 200, { exit: result });
   } catch (error) {
     return next(error || new AppError(500, 'Exit failed'));

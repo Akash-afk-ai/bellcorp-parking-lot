@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS vehicles (
   id SERIAL PRIMARY KEY,
   vehicle_number VARCHAR(30) NOT NULL UNIQUE,
   vehicle_type VARCHAR(20) NOT NULL CHECK (vehicle_type IN ('BIKE', 'CAR', 'TRUCK')),
+  owner_name VARCHAR(100),
+  phone_number VARCHAR(20),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -56,6 +58,13 @@ CREATE INDEX IF NOT EXISTS idx_vehicles_vehicle_number
 
 CREATE INDEX IF NOT EXISTS idx_users_email
   ON users (email);
+
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS owner_name VARCHAR(100);
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS phone_number VARCHAR(20);
+
+CREATE UNIQUE INDEX IF NOT EXISTS unique_active_ticket_per_vehicle
+  ON parking_tickets (vehicle_id)
+  WHERE status = 'ACTIVE';
 
 -- Seed fixed slots based on the assignment requirement.
 INSERT INTO parking_slots (slot_number, vehicle_type, status)
